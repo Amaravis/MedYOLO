@@ -152,7 +152,8 @@ def mask_maker(bbox_path: str, nifti_path: str, mask_path: str):
         min_x = max(0, min_x)
         max_x = min(width, max_x)
 
-        mask_array[min_x:max_x+1, min_y:max_y+1, min_z:max_z+1] = 1
+        #mask_array[min_x:max_x+1, min_y:max_y+1, min_z:max_z+1] = 1
+        mask_array[min_y:max_y+1, min_x:max_x+1, min_z:max_z+1] = 1
         
     mask_nifti = nib.Nifti1Image(mask_array, nifti.affine)
     nib.save(mask_nifti, mask_path)

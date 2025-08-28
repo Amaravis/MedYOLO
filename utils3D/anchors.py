@@ -33,12 +33,12 @@ def nifti_check_anchors(dataset, model, thr=4.0, imgsz=default_size):
     prefix = 'autoanchor: '
     print(f'\n{prefix}Analyzing anchors... ', end='')
     m = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]  # Detect()
-
+    
     # converting to pixel widths instead of fractional width using dimensions of resized images
     shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
     scale = np.random.uniform(0.9, 1.1, size=(dataset.shapes.shape[0],1))  # augment scale
     dwh = torch.tensor(np.concatenate([l[:, 4:7] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # convert dwh from proportion to voxel values
-
+    #print(dwh.shape)
     def metric(k):  # compute metrics for anchors
         r = dwh[:, None] / k[None]
         x = torch.min(r, 1./r).min(2)[0] # ratio metric

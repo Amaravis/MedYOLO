@@ -52,7 +52,7 @@ RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
 # testing parameters, remove after dev
-default_size = 350 # edge length for testing, below 350 the model can't process the data
+default_size = 256 # edge length for testing, below 350 the model can't process the data
 default_epochs = 200
 default_batch = 8
 
