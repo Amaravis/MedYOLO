@@ -459,3 +459,40 @@ class ConfusionMatrix:
         for i in range(self.nc + 1):
             print(' '.join(map(str, self.matrix[i])))
 
+
+
+# contrastive for adaptive centers
+class SupConLossAdaptive(nn.Module):
+    def __init__(self, temperature=0.07, num_classes=40, embedSize=512):
+        super(SupConLossAdaptive, self).__init__()
+        self.temperature = temperature
+        self.num_classes = num_classes
+        self.embedSize = embedSize
+        self.centers = nn.Parameter(torch.randn(self.num_classes, self.embedSize).cuda())
+
+    def forward(self, features, labels):
+
+        device = (torch.device('cuda')
+                  if features.is_cuda
+                  else torch.device('cpu'))
+
+        batch_size = features.shape[0]
+        labels = labels.contiguous().view(-1, 1)
+        classes = torch.arange(self.num_classes).contiguous().view(-1, 1).to(device)
+        mask = torch.eq(labels, classes.T).float().to(device)
+        #mask = F.one_hot(labels, self.num_classes).float().to(device)
+
+        anchor_dot_contrast = torch.div(
+            torch.matmul(features, self.centers.T),
+            self.temperature)
+        #pdb.set_trace()
+        # normalize the logits for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+        
+        # compute log_prob
+        exp_logits = torch.exp(logits)
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        loss = -((mask * log_prob).sum(1)/mask.sum(1)).mean()
+        return loss

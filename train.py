@@ -37,9 +37,9 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve
 
 # 3D YOLO imports
-from models3D.model import Model, attempt_load
+from models3D.model import Model, attempt_load, ModelWithRoiEmbeddings
 from utils3D.datasets import nifti_dataloader, normalize_CT, normalize_MR
-from utils3D.lossandmetrics import ComputeLossVF
+from utils3D.lossandmetrics import ComputeLossVF, SupConLossAdaptive
 from utils3D.anchors import nifti_check_anchors
 from utils3D.general import check_dataset
 
@@ -52,10 +52,65 @@ RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
 # testing parameters, remove after dev
-default_size = 256 # edge length for testing, below 350 the model can't process the data
+default_size = 350 # edge length for testing, below 350 the model can't process the data
 default_epochs = 200
 default_batch = 8
 
+def targets_to_boxes_list(targets: torch.Tensor, B: int):
+    """
+    targets: (N,8) -> [b, cls, z, x, y, d, w, h] in [0,1]
+    returns: list length B with (Ri,6) MedYOLO (zc, xc, yc, d, w, h)
+    """
+    device = targets.device
+    dtype = targets.dtype
+    boxes_list = [torch.empty(0, 6, device=device, dtype=dtype) for _ in range(B)]
+    if targets.numel() == 0:
+        return boxes_list
+    b_ix = targets[:, 0].long()
+    boxes = targets[:, 2:8]  # (z, x, y, d, w, h)
+    for bi in range(B):
+        m = (b_ix == bi)
+        if m.any():
+            boxes_list[bi] = boxes[m]
+    return boxes_list
+
+def targets_to_labels_list(targets: torch.Tensor, B: int, pos_label=1):
+    """
+    returns list length B with (Ri,) int labels for ROIs (pos=1 by default)
+    """
+    device = targets.device
+    if targets.numel() == 0:
+        return [torch.empty(0, dtype=torch.long, device=device) for _ in range(B)]
+    b_ix = targets[:, 0].long()
+    cls  = targets[:, 1].long()  # or map to 1/0 as needed
+    # Example: treat any GT as positive (1)
+    y = torch.full_like(cls, fill_value=pos_label)
+    labels_list = []
+    for bi in range(B):
+        m = (b_ix == bi)
+        labels_list.append(y[m])
+    return labels_list
+
+def merge_pos_neg_boxes_labels(pos_boxes, pos_labels, neg_targets, B: int):
+    """
+    neg_targets: (M,8) same format; assign 0 to negatives
+    """
+    if neg_targets is None or neg_targets.numel() == 0:
+        return pos_boxes, pos_labels
+    neg_boxes = targets_to_boxes_list(neg_targets, B)
+    neg_labels = [torch.zeros(len(nb), dtype=torch.long, device=nb.device) for nb in neg_boxes]
+    merged_boxes, merged_labels = [], []
+    for pb, pl, nb, nl in zip(pos_boxes, pos_labels, neg_boxes, neg_labels):
+        if nb.numel() == 0:
+            merged_boxes.append(pb)
+            merged_labels.append(pl)
+        elif pb.numel() == 0:
+            merged_boxes.append(nb)
+            merged_labels.append(nl)
+        else:
+            merged_boxes.append(torch.cat([pb, nb], dim=0))
+            merged_labels.append(torch.cat([pl, nl], dim=0))
+    return merged_boxes, merged_labels
 
 def train(hyp, opt, device, callbacks):
     # parsing the arguments
@@ -99,8 +154,29 @@ def train(hyp, opt, device, callbacks):
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
     else:        
-        model = Model(cfg = cfg, ch=1, nc=nc, anchors=hyp.get('anchors')).to(device)
-    
+        #model = Model(cfg = cfg, ch=1, nc=nc, anchors=hyp.get('anchors')).to(device)
+        model = ModelWithRoiEmbeddings(
+            cfg=cfg,
+            ch=1,
+            nc=nc,
+            anchors = hyp.get('anchors'),
+            tap_ids=(0, 1, 3),          # e.g., backbone P3/P4 after C3
+            crop_size=(16, 32, 32),
+            embed_dim=256,
+            proj_dim=256,            # <-- embedding size that comes out of head
+            patch=(2,2,2),
+            pooling='mean'
+        ).to(device)
+        
+    use_roi_emb = isinstance(model, ModelWithRoiEmbeddings)
+    center_loss = SupConLossAdaptive(
+    temperature=0.07,
+    num_classes=2,                 # or your K
+    embedSize=256,            # must match your embedding size
+    ).to(device)
+
+    # attach as submodule so DDP will all-reduce its grads
+    model.center_loss = center_loss
     # loads from models folder
     with open(data, errors='ignore') as f:
         data_dict = yaml.safe_load(f)  # model dict
@@ -143,6 +219,13 @@ def train(hyp, opt, device, callbacks):
     optimizer.add_param_group({'params': g1, 'weight_decay': hyp['weight_decay']})  # add g1 with weight_decay
     optimizer.add_param_group({'params': g2})  # add g2 (biases)
     del g0, g1, g2
+
+    center_lr_scale = 0.25  # tweak as you like
+    optimizer.add_param_group({
+        'params': model.center_loss.parameters(),
+        'weight_decay': 0.0,
+        'lr': hyp['lr0'] * center_lr_scale
+    })
     
     # Scheduler
     lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
@@ -163,7 +246,7 @@ def train(hyp, opt, device, callbacks):
                                                    stride=stride,
                                                    rank=LOCAL_RANK,
                                                    workers=workers,
-                                                   augment=True)
+                                                   augment=True,sample_negatives=True,return_negatives=True)
     mlc = int(np.concatenate(train_dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
@@ -175,7 +258,7 @@ def train(hyp, opt, device, callbacks):
                                       batch_size=batch_size,
                                       stride=stride,
                                       single_cls=single_cls,
-                                      workers=workers)[0]
+                                      workers=workers,sample_negatives=False,return_negatives=False)[0]
 
         if not resume:
             # Anchors
@@ -224,7 +307,12 @@ def train(hyp, opt, device, callbacks):
         optimizer.zero_grad()
         
         # train loop
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, batch in pbar:  # batch -------------------------------------------------------------
+            if len(batch) == 5:
+                imgs, pos_targets, neg_targets, paths, _ = batch  # NEW: neg_targets
+            else:
+                imgs, pos_targets, paths, _ = batch
+                neg_targets = None
             ni = i + nb * epoch  # number integrated batches (since train start)
             # Normalization
             if norm.lower() == 'ct':
@@ -248,8 +336,26 @@ def train(hyp, opt, device, callbacks):
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device).float())  # loss scaled by batch_size
+                loss, loss_items = compute_loss(pred, pos_targets.to(device).float())  # loss scaled by batch_size
                 del pred
+
+                if use_roi_emb:
+                    B = imgs.size(0)
+                    pos_boxes_list  = targets_to_boxes_list(pos_targets.to(device), B)
+                    pos_labels_list = targets_to_labels_list(pos_targets.to(device), B, pos_label=1)
+                    boxes_list, labels_list = merge_pos_neg_boxes_labels(pos_boxes_list, pos_labels_list,
+                                                                        neg_targets.to(device) if neg_targets is not None else None,
+                                                                        B=B)
+                    # Run the embedding branch by calling forward with boxes
+                    _, (emb, idx) = model(imgs, boxes=boxes_list, return_embeddings=True)
+
+                    # gather labels aligned to idx
+                    b_ix = idx[:, 0].tolist()
+                    r_ix = idx[:, 1].tolist()
+                    y = torch.stack([labels_list[bi][ri] for bi, ri in zip(b_ix, r_ix)]).to(device)
+
+                    loss_ctr = center_loss(emb, y)
+                    loss = loss + 0.1 * loss_ctr
 
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
@@ -271,9 +377,9 @@ def train(hyp, opt, device, callbacks):
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
-                    f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, False)
-            del imgs, targets
+                    f'{epoch}/{epochs - 1}', mem, *mloss, pos_targets.shape[0], imgs.shape[-1]))
+                callbacks.run('on_train_batch_end', ni, model, imgs, pos_targets, paths, plots, False)
+            del imgs, pos_targets
             # end batch ------------------------------------------------------------------------------------------------
             
         # Scheduler
@@ -287,6 +393,7 @@ def train(hyp, opt, device, callbacks):
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
+                ema.ema.eval()
                 results, _, _ = val.run(data_dict,
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,

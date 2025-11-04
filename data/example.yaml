@@ -5,6 +5,9 @@
 train: /scratch/svaidy33/CMB_detection/YOLO_data/images/train/
 val: /scratch/svaidy33/CMB_detection/YOLO_data/images/val/
 
+#train: /scratch/svaidy33/CMB_detection/YOLO_data/realswi_aug/images/train/
+#val: /scratch/svaidy33/CMB_detection/YOLO_data/realswi_aug/images/val/
+
 # number of classes
 nc: 1
 

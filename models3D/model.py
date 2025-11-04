@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 import math
-
+from models3D.roi3d import ROIEmbedHead3D
 # set path for local imports
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO3D root directory
@@ -471,3 +471,106 @@ class Model(nn.Module):
 
     def info(self, verbose=False):
         model_info(self, verbose)
+
+class ModelWithRoiEmbeddings(Model):  # assume your base YOLO class is "Model"
+    def __init__(self, *args, tap_ids=(0, 1, 3), embed_dim=256, proj_dim=256,
+                 crop_size=(16,32,32), patch=(2,2,2), pooling='mean', **kwargs):
+                     
+        self.tap_ids = tuple(tap_ids)
+        self._taps = None               # not a list yet; signals "embedding not ready"
+        self._hook_handles = []
+        self.enable_embeddings = False  # disabled during build & eval
+        self.roi_embed_head = None      # created after base model is built
+        super().__init__(*args, **kwargs)
+        self.tap_ids = tap_ids
+
+        # Infer channels of tapped layers (adapt to your modules if needed)
+        in_channels = []
+        for i in tap_ids:
+            m = self.model[i]
+            # Try common attributes that hold out channels:
+            c = getattr(m, 'cv2', getattr(m, 'conv', getattr(m, 'bn', None)))
+            oc = None
+            if hasattr(c, 'out_channels'):
+                oc = c.out_channels
+            elif hasattr(m, 'ch'):  # some repos keep 'ch'
+                oc = m.ch
+            if oc is None:
+                raise RuntimeError(f"Cannot infer out_channels for layer {i}.")
+            in_channels.append(oc)
+
+        self.roi_embed_head = ROIEmbedHead3D(
+            in_channels=in_channels,
+            crop_size=crop_size,
+            embed_dim=embed_dim,
+            patch=patch,
+            proj_dim=proj_dim,
+            pooling=pooling,
+        )
+
+        # Buffer for tapped activations
+        self._taps = [None] * len(tap_ids)
+        for slot, lid in enumerate(tap_ids):
+            self.model[lid].register_forward_hook(self._make_hook(slot))
+
+    def _make_hook(self, slot):
+        def hook(_m, _inp, out):
+            self._taps[slot] = out
+        return hook
+
+    def _attach_hooks(self):
+        if self._hook_handles:  # already attached
+            return
+        for slot, lid in enumerate(self.tap_ids):
+            self._hook_handles.append(self.model[lid].register_forward_hook(self._make_hook(slot)))
+
+    def _detach_hooks(self):
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles.clear()
+        if isinstance(self._taps, list):
+            for i in range(len(self._taps)):
+                self._taps[i] = None
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.enable_embeddings = bool(mode)
+        if mode:
+            self._attach_hooks()
+        else:
+            self._detach_hooks()
+        return self
+
+    def forward(self, x, boxes=None, return_embeddings=None, *args, **kwargs):
+        """
+        boxes: list[Tensor(Ri,6)] or Tensor(B,R,6) with normalized (zc,yc,xc,d,h,w) in [0,1]
+        """
+        det_out = super().forward(x, *args, **kwargs)  # normal detector path
+
+        if return_embeddings is None:
+            return_embeddings = self.enable_embeddings
+        
+        if (not return_embeddings) or (self.roi_embed_head is None) or (not isinstance(self._taps, list)):
+            return det_out
+
+        # If hooks not yet produced features (first pass), just return detector
+        if any(t is None for t in self._taps):
+            return det_out
+
+        # Need boxes to compute ROI embeddings; if absent, return detector
+        if boxes is None:
+            return det_out
+
+        emb_out = None
+
+        if return_embeddings:
+            feats = [t for t in self._taps]
+            if any(f is None for f in feats):
+                raise RuntimeError("Tapped features not ready; ensure hooks cover executed layers.")
+            if boxes is None:
+                raise ValueError("boxes must be provided (normalized GT boxes) to compute ROI embeddings.")
+            emb_out, idx = self.roi_embed_head(feats, boxes)
+            # You can also return idx if you need to map embeddings back to images/boxes.
+            return det_out, (emb_out, idx)
+
+        return det_out

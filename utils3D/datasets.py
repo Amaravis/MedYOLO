@@ -14,6 +14,7 @@ from itertools import repeat
 from typing import List
 import torch
 from torch.utils.data import Dataset
+from scipy.ndimage import binary_dilation, binary_erosion
 
 # 2D YOLO imports
 from utils.torch_utils import torch_distributed_zero_first
@@ -142,7 +143,16 @@ class LoadNiftisAndLabels(Dataset):
     cache_version = 0.61  # dataset labels *.cache version
 
     def __init__(self, path, img_size=default_size, batch_size=4, augment=False, hyp=None, single_cls=False,
-                 stride=32, pad=0.0, prefix=''):
+                 stride=32, pad=0.0, prefix='', 
+                 sample_negatives=True,          
+                 neg_ratio=1.0,                   
+                 max_iou_neg=0.05,                
+                 size_jitter=0.25,                
+                 brain_coverage_thresh=0.35,      
+                 min_neg_when_no_pos=4,           
+                 brain_dilate=2,               
+                 max_neg_trials=2000,             
+                 return_negatives=True,mask_percentile=10):         # if True, __getitem__ returns negatives as 5th item):
         """Initialization for the training Dataset
 
         Args:
@@ -163,6 +173,16 @@ class LoadNiftisAndLabels(Dataset):
         self.path = path
         self.augment = augment
         self.hyp = hyp
+        self.sample_negatives = sample_negatives
+        self.neg_ratio = float(neg_ratio)
+        self.max_iou_neg = float(max_iou_neg)
+        self.size_jitter = float(size_jitter)
+        self.brain_coverage_thresh = float(brain_coverage_thresh)
+        self.min_neg_when_no_pos = int(min_neg_when_no_pos)
+        self.brain_dilate = int(brain_dilate)
+        self.max_neg_trials = int(max_neg_trials)
+        self.return_negatives = bool(return_negatives)
+        self.mask_percentile = float(mask_percentile)
 
         # Find files in the given path and filter to leave only .nii and .nii.gz files in the list
         try:
@@ -339,7 +359,45 @@ class LoadNiftisAndLabels(Dataset):
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        return img, labels_out, self.img_files[self.indices[index]], shapes
+        #return img, labels_out, self.img_files[self.indices[index]], shapes
+        if not self.sample_negatives:
+            return img, labels_out, self.img_files[self.indices[index]], shapes
+
+        # --- RANDOM NEGATIVES FROM BRAIN MASK (no IoU) ---
+        k_neg = int(nl * self.neg_ratio) if nl > 0 else int(self.min_neg_when_no_pos)
+        #print(labels)
+        neg_norm = self._sample_random_negatives_noiou(img, k_neg, labels[:, 1:7] if nl else None)
+
+        neg_out = torch.zeros((len(neg_norm), 8), dtype=torch.float32)
+        if len(neg_norm):
+            # Put cls = -1 as a sentinel for “background”; your loss/target code should skip cls < 0.
+            neg = np.concatenate([np.full((len(neg_norm), 1), 1.0, dtype=np.float32), neg_norm], axis=1)
+            neg_out[:, 1:] = torch.from_numpy(neg)
+
+        if not self.return_negatives:
+            # If you’d rather append negatives to labels_out, you can:
+            # labels_out = torch.cat([labels_out, neg_out], dim=0)
+            return img, labels_out, self.img_files[self.indices[index]], shapes
+
+        # return negatives as a separate tensor (preferred for custom losses / mining)
+        return img, labels_out, self.img_files[self.indices[index]], shapes, neg_out
+
+
+    def _brain_mask(self, img_4d):
+        """
+        Build a coarse brain mask (D,H,W) from image (1,D,H,W).
+        Threshold at a robust low percentile of non-zero intensities, then optional smooth.
+        """
+        vol = img_4d[0].detach().cpu().numpy()  # (D,H,W)
+        nz = vol[vol > 0]
+        if nz.size == 0:
+            return np.zeros_like(vol, dtype=bool)
+        t = np.percentile(nz, self.mask_percentile)
+        mask = vol > max(t, 0.0)
+        if self.brain_dilate > 0:
+            mask = binary_dilation(mask, iterations=self.brain_dilate)
+            mask = binary_erosion(mask, iterations=1)
+        return mask
 
     @staticmethod
     def collate_fn(batch):
@@ -349,9 +407,150 @@ class LoadNiftisAndLabels(Dataset):
             l[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
+    @staticmethod
+    def collate_fn_with_negatives(batch):
+        img, pos, path, shapes, neg = zip(*batch)
+        imgs = torch.stack(img, 0)
+
+        pos_cat = []
+        for i, l in enumerate(pos):
+            if l.numel():
+                l = l.clone()
+                l[:, 0] = i  # image index for targets
+            pos_cat.append(l)
+        pos_cat = torch.cat(pos_cat, 0) if len(pos_cat) else torch.zeros((0, 8))
+
+        neg_cat = []
+        for i, l in enumerate(neg):
+            if l.numel():
+                l = l.clone()
+                l[:, 0] = i
+            neg_cat.append(l)
+        neg_cat = torch.cat(neg_cat, 0) if len(neg_cat) else torch.zeros((0, 8))
+
+        return imgs, pos_cat, neg_cat, path, shapes
+
+    @staticmethod
+    def _zxydwhn_to_abs(lbls_n, D, H, W):
+        """Convert YOLO-norm [cls,z,x,y,d,w,h] -> absolute (z,x,y,d,w,h)."""
+        if lbls_n.size == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        a = lbls_n.copy()
+        a[:, 0] *= D
+        a[:, 1] *= W
+        a[:, 2] *= H
+        a[:, 3] *= D
+        a[:, 4] *= W
+        a[:, 5] *= H
+        return a[:, 1:7].astype(np.float32)
+
+
+    @staticmethod
+    def _abs_to_zxydwhn(boxes_abs, D, H, W):
+        """(z,x,y,d,w,h) absolute -> normalized YOLO order [z,x,y,d,w,h]."""
+        if boxes_abs.size == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        b = boxes_abs.astype(np.float32).copy()
+        b[:, 0] /= D; b[:, 1] /= W; b[:, 2] /= H
+        b[:, 3] /= D; b[:, 4] /= W; b[:, 5] /= H
+        return b
+
+    @staticmethod
+    def _integral3d(mask_bool):
+        """
+        3D summed area table of a boolean mask (D,H,W) -> (D+1,H+1,W+1)
+        Allows O(1) box sums.
+        """
+        integ = mask_bool.astype(np.uint8).cumsum(0).cumsum(1).cumsum(2)
+        out = np.zeros((mask_bool.shape[0]+1, mask_bool.shape[1]+1, mask_bool.shape[2]+1), dtype=np.int32)
+        out[1:, 1:, 1:] = integ
+        return out
+
+    @staticmethod
+    def _sum_box_integral(integ, z1, z2, y1, y2, x1, x2):
+        """
+        Sum of mask over [z1:z2, y1:y2, x1:x2] using integral image.
+        All indices are ints, half-open ranges; assumes 0<=z1<z2<=D etc.
+        """
+        return (integ[z2, y2, x2] - integ[z1, y2, x2] - integ[z2, y1, x2] - integ[z2, y2, x1]
+                + integ[z1, y1, x2] + integ[z1, y2, x1] + integ[z2, y1, x1] - integ[z1, y1, x1])
+
+    
+    def _sample_random_negatives_noiou(self, img, count, pos_lbls_norm=None):
+        """
+        Fast negative sampler: NO IoU checks, only requires 'brain coverage' in the box.
+        - Draw centers from brain voxels.
+        - Draw sizes from positive size distribution if available (with jitter), otherwise from a small default range.
+        Returns (K,6) normalized [z,x,y,d,w,h] (no class column).
+        """
+        D, H, W = img.shape[1], img.shape[2], img.shape[3]
+        mask = self._brain_mask(img)               # (D,H,W) bool
+        if not mask.any():
+            return np.zeros((0, 6), dtype=np.float32)
+
+        integ = self._integral3d(mask)             # (D+1,H+1,W+1)
+        coords = np.argwhere(mask)                 # (N, 3) as (z,y,x)
+        rng = np.random.default_rng()
+
+        # Base sizes: prefer positive sizes (absolute) with jitter; else fallback small-ish cubes
+        base_sizes = None
+        if pos_lbls_norm is not None and pos_lbls_norm.size:
+            abs_pos = self._zxydwhn_to_abs(pos_lbls_norm, D, H, W)
+            if abs_pos.shape[0] > 0:
+                base_sizes = abs_pos[:, 3:6]  # (d,w,h)
+
+        out = []
+        trials = 0
+        max_trials = max(self.max_neg_trials, 50 * (count + 1))
+
+        while len(out) < count and trials < max_trials:
+            trials += 1
+
+            # --- choose size ---
+            if base_sizes is not None:
+                #b = base_sizes[rng.integers(0, len(base_sizes))]
+                #jitter = rng.uniform(1.0 - self.size_jitter, 1.0 + self.size_jitter, size=3)
+                #d, w, h = np.clip(b * jitter, 4.0, [D * 0.4, W * 0.4, H * 0.4]).astype(np.float32)
+                #d, w, h = base_sizes[0].astype(np.float32)
+                d, w, h = 10, 24, 24
+            else:
+                # default small range (1–6% of dimension), clipped to >=4 vox
+                #d = float(rng.integers(max(4, int(0.01 * D)), max(6, int(0.06 * D)) + 1))
+                #w = float(rng.integers(max(4, int(0.01 * W)), max(6, int(0.06 * W)) + 1))
+                #h = float(rng.integers(max(4, int(0.01 * H)), max(6, int(0.06 * H)) + 1))
+                d = 10
+                w = 24
+                h = 24
+
+            # --- choose center from brain voxels, then clamp to keep box in-bounds ---
+            zc, yc, xc = coords[rng.integers(0, len(coords))]
+            z1 = int(max(0, np.round(zc - d / 2))); y1 = int(max(0, np.round(yc - h / 2))); x1 = int(max(0, np.round(xc - w / 2)))
+            z2 = int(min(D, z1 + int(np.round(d)))); y2 = int(min(H, y1 + int(np.round(h)))); x2 = int(min(W, x1 + int(np.round(w))))
+            if z2 - z1 < 2 or y2 - y1 < 2 or x2 - x1 < 2:
+                continue
+
+            # --- brain coverage check (avoid black edges) ---
+            brain_vox = self._sum_box_integral(integ, z1, z2, y1, y2, x1, x2)
+            frac = brain_vox / float((z2 - z1) * (y2 - y1) * (x2 - x1))
+            if frac < self.brain_coverage_thresh:
+                continue
+
+            # accept; convert to center-size (z,x,y,d,w,h)
+            z = (z1 + z2) / 2.0; y = (y1 + y2) / 2.0; x = (x1 + x2) / 2.0
+            d = float(z2 - z1); h = float(y2 - y1); w = float(x2 - x1)
+            out.append([z, x, y, d, w, h])
+
+        if not out:
+            return np.zeros((0, 6), dtype=np.float32)
+
+        out = np.asarray(out, dtype=np.float32)
+        # normalize to [0,1] in YOLO order [z,x,y,d,w,h]
+        out[:, 0] /= D; out[:, 1] /= W; out[:, 2] /= H
+        out[:, 3] /= D; out[:, 4] /= W; out[:, 5] /= H
+        return out
 
 def nifti_dataloader(path: str, imgsz: int, batch_size: int, stride: int, single_cls=False, hyp=None, augment=False, pad=0.0,
-                     rank=-1, workers=8, prefix=''):
+                     rank=-1, workers=8, prefix='',sample_negatives=True, return_negatives=True):
     """This is the dataloader used in the training process
     The same as that of 2D YOLO, just built around a different Dataset definition
 
@@ -380,18 +579,20 @@ def nifti_dataloader(path: str, imgsz: int, batch_size: int, stride: int, single
                                       single_cls=single_cls,
                                       stride=stride,
                                       pad=pad,
-                                      prefix=prefix)
+                                      prefix=prefix,sample_negatives=sample_negatives,return_negatives=return_negatives)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     loader = InfiniteDataLoader
+    collate = LoadNiftisAndLabels.collate_fn if not getattr(dataset, "return_negatives", False) \
+          else LoadNiftisAndLabels.collate_fn_with_negatives
     dataloader = loader(dataset,
                         batch_size=batch_size,
                         num_workers=nw,
                         sampler=sampler,
                         pin_memory=True, # may need to set False to resolve memory issues
-                        collate_fn=LoadNiftisAndLabels.collate_fn)
+                        collate_fn=collate)
     return dataloader, dataset
 
 
